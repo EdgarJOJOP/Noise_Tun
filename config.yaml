@@ -1,0 +1,56 @@
+# NoiseTunnel 配置文件
+
+# 日志级别: DEBUG, INFO, WARNING, ERROR
+log_level: INFO
+
+# SOCKS5 代理配置
+socks5:
+  host: "localhost"
+  port: 1086
+  udp_enabled: true
+
+# 局域网额外监听（其他设备通过此地址使用代理）
+additional_bind:
+  enabled: false
+  host: "0.0.0.0"
+  port: 1087
+
+# 噪声引擎配置
+noise:
+  # TCP 噪声
+  tcp_enabled: true
+  tcp_min_port: 1024
+  tcp_max_port: 65535
+
+  # UDP 噪声
+  udp_enabled: true
+  udp_min_port: 1024
+  udp_max_port: 65535
+
+  # 噪声包大小范围
+  min_payload_size: 100
+  max_payload_size: 1500
+
+  # 加密 DNS (DoH)
+  doh_url: "https://cloudflare-dns.com/dns-query"
+  doh_timeout: 5.0
+  dns_cache_ttl: 300
+  domain_pool_size: 200
+
+# 自适应密度控制器配置
+density:
+  # 滑动窗口（秒）
+  window_seconds: 10.0
+
+  # ─── 流量判定阈值 ───
+  high_traffic_threshold: 10    # >10 连接/窗口 → 高流量
+  low_traffic_threshold: 1      # <1 连接/窗口 → 低流量
+  silence_seconds: 5.0          # 持续 5 秒无流量 → 静默
+
+  # ─── 对应噪声密度 ───
+  # 高流量时：20% 噪声，融入真实流中
+  high_traffic_density: 0.20
+  # 低流量时：50% 噪声，防止"静默指纹"
+  low_traffic_density: 0.50
+  # 完全静默时：10% 心跳噪声，模拟后台应用活动
+  silence_density: 0.10
