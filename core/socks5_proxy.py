@@ -79,7 +79,7 @@ class ProxyServer:
         addr = listeners[0].getsockname() if listeners else (self.host, self.port)
         auth_info = f" (auth={bool(self.username)})" if self.username else ""
         doh_info = " (DoH)" if self._doh else " (⚠️ 无 DoH)"
-        enforce_info = " (阻断)" if self._enforce_doh_only else " (回退系统DNS)"
+        enforce_info = " (阻断明文dns使用)" if self._enforce_doh_only else " (回退系统DNS)"
         logger.info(f"代理已启动 (SOCKS5 + HTTP CONNECT): {addr[0]}:{addr[1]}{auth_info}{doh_info}{enforce_info}")
 
         # 额外局域网监听
