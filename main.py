@@ -88,8 +88,10 @@ async def main():
     # DNS
     doh = DoHResolver(
         doh_url=config.noise.doh_url,
+        fallback_doh_url=config.noise.fallback_doh_url,
         timeout=config.noise.doh_timeout,
         cache_ttl=config.noise.dns_cache_ttl,
+        cache_enabled=config.noise.dns_cache_enabled,
     )
     domain_pool = FakeSNIGenerator()
 
@@ -132,6 +134,11 @@ async def main():
     udp_sampler = UDPSampler()
     udp_gen.set_sampler(udp_sampler)
 
+    # ★ 新增：UDP 真实目标 → injector
+    def on_udp_real_target(dst_ip, dst_port):
+        injector.record_real_udp_target(dst_ip, dst_port)
+    udp_sampler.set_on_real_udp_target(on_udp_real_target)
+
     # 连接回调：注入器记录真实流量（含解析到的真实 IP）
     def on_connection(host, resolved_ip, port, proto):
         injector.record_real_connection(host, resolved_ip, port, proto)
@@ -151,6 +158,10 @@ async def main():
         on_connection=on_connection,
         on_tls_template=on_tls_template,
         additional_bind=extra_bind,
+        username=config.socks5.username,
+        password=config.socks5.password,
+        doh_resolver=doh,
+        enforce_doh_only=config.noise.enforce_doh_only,
     )
 
     # 检查端口是否被旧进程占用

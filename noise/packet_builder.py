@@ -248,3 +248,89 @@ def build_fake_tls_client_hello(fake_sni: Optional[str] = None) -> bytes:
     record = record_body + hs_body
 
     return record
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TLS 1.3 ClientHello （新增）
+# ══════════════════════════════════════════════════════════════════════
+
+def build_fake_tls13_client_hello(fake_sni: Optional[str] = None) -> bytes:
+    """
+    构造 TLS 1.3 Client Hello
+
+    TLS 1.3 CH 与 1.2 的关键区别：
+    - supported_versions 扩展中版本 = 0x0304
+    - 必须包含 key_share 扩展
+    - 使用 TLS_AES_128_GCM_SHA256 (0x1301) 等新套件
+    - supported_groups = X25519 (0x001d) / P-256 (0x0017)
+    """
+    content_type = bytes([0x16])  # Handshake
+    tls_version = bytes([0x03, 0x03])  # 记录层版本仍用 1.2
+
+    handshake_type = bytes([0x01])  # Client Hello
+
+    random_bytes = randbytes(32)
+    session_id_len = 32
+    session_id = randbytes(session_id_len)
+
+    # TLS 1.3 密码套件
+    tls13_ciphers = bytes([
+        0x13, 0x01,  # TLS_AES_128_GCM_SHA256
+        0x13, 0x02,  # TLS_AES_256_GCM_SHA384
+        0x13, 0x03,  # TLS_CHACHA20_POLY1305_SHA256
+    ])
+    cs_count = len(tls13_ciphers)
+
+    compression_len = 1
+    compression = bytes([0x00])  # TLS 1.3 只允许 null compression
+
+    # ---- 构建扩展 ----
+    extensions = b""
+
+    # 1) SNI (type=0x0000)
+    if fake_sni:
+        sni_name = fake_sni.encode("utf-8")
+        sni_ext_body = (
+            struct.pack("!H", len(sni_name) + 3) +
+            b"\x00" +
+            struct.pack("!H", len(sni_name)) +
+            sni_name
+        )
+        extensions += b"\x00\x00" + struct.pack("!H", len(sni_ext_body)) + sni_ext_body
+
+    # 2) supported_versions (type=0x002b)
+    sv_body = bytes([0x03, 0x04])  # TLS 1.3 = 0x0304
+    extensions += b"\x00\x2b" + struct.pack("!H", len(sv_body)) + sv_body
+
+    # 3) key_share (type=0x0033)
+    ks_group = randchoice([b"\x00\x1d", b"\x00\x17"])  # X25519 or P-256
+    ks_key = randbytes(32 if ks_group == b"\x00\x1d" else 65)
+    ks_entry = ks_group + struct.pack("!H", len(ks_key)) + ks_key
+    ks_body = struct.pack("!H", len(ks_entry)) + ks_entry
+    extensions += b"\x00\x33" + struct.pack("!H", len(ks_body)) + ks_body
+
+    # 4) signature_algorithms (type=0x000d)
+    sig_algs = bytes([0x04, 0x03, 0x08, 0x04, 0x08, 0x07, 0x04, 0x01])
+    sig_body = struct.pack("!H", len(sig_algs)) + sig_algs
+    extensions += b"\x00\x0d" + struct.pack("!H", len(sig_body)) + sig_body
+
+    # 5) supported_groups (type=0x000a)
+    groups = bytes([0x00, 0x1d, 0x00, 0x17, 0x00, 0x1e])
+    groups_body = struct.pack("!H", len(groups)) + groups
+    extensions += b"\x00\x0a" + struct.pack("!H", len(groups_body)) + groups_body
+
+    # 6) psk_key_exchange_modes (type=0x002d)
+    psk_modes = bytes([0x01, 0x01])  # psk_dhe_ke
+    extensions += b"\x00\x2d" + struct.pack("!H", len(psk_modes)) + psk_modes
+
+    # ---- 组装 ----
+    ch_body = tls_version + random_bytes + bytes([session_id_len]) + session_id
+    ch_body += struct.pack("!H", cs_count) + tls13_ciphers
+    ch_body += bytes([compression_len]) + compression
+    ch_body += struct.pack("!H", len(extensions)) + extensions
+
+    hs_body = handshake_type + len(ch_body).to_bytes(3, "big") + ch_body
+    record_body = content_type + tls_version + struct.pack("!H", len(hs_body))
+    record = record_body + hs_body
+
+    return record

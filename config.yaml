@@ -8,12 +8,16 @@ socks5:
   host: "localhost"
   port: 1086
   udp_enabled: true
+  username: ""
+  password: ""
 
 # 局域网额外监听（其他设备通过此地址使用代理）
 additional_bind:
   enabled: false
   host: "0.0.0.0"
   port: 1087
+  username: ""
+  password: ""
 
 # 噪声引擎配置
 noise:
@@ -32,10 +36,16 @@ noise:
   max_payload_size: 1500
 
   # 加密 DNS (DoH)
-  doh_url: "https://cloudflare-dns.com/dns-query"
+  doh_url: "https://127.0.0.1:8443/dns-query"
+  # 备用 DoH URL（主 DoH 无结果或失败时自动尝试，置空=不启用）
+  fallback_doh_url: ""
   doh_timeout: 5.0
   dns_cache_ttl: 300
+  # true=缓存 DNS 结果（省流量，默认），false=每次请求都查 DoH（获取最新 IP）
+  dns_cache_enabled: false
   domain_pool_size: 200
+  # true=DoH 解析失败时阻断连接（绝不回退系统 DNS），false=允许回退
+  enforce_doh_only: true
 
 # 自适应密度控制器配置
 density:

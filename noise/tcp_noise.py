@@ -1,4 +1,4 @@
-"""TCP 全随机噪声包生成器"""
+"""TCP 全随机噪声包生成器 — 混合 TLS 1.2 / 1.3"""
 
 import struct
 import logging
@@ -6,7 +6,8 @@ from typing import Optional, Tuple
 
 from .packet_builder import (
     randbytes, randint, build_ip_header, build_tcp_header,
-    compute_tcp_checksum, build_fake_tls_client_hello
+    compute_tcp_checksum, build_fake_tls_client_hello,
+    build_fake_tls13_client_hello,
 )
 
 logger = logging.getLogger("noisetunnel.tcp_noise")
@@ -18,16 +19,21 @@ class TCPNoisePacketGenerator:
 
     生成结构完整的 IP + TCP + TLS Client Hello 数据包，
     每个字段均为 CSPRNG 均匀随机，无任何可学习的分布偏置。
+
+    ★ 增强：混合 TLS 1.2 和 TLS 1.3 ClientHello
     """
 
     def __init__(self, tun_ip: str = "10.99.0.2",
                  src_port_min: int = 1024,
-                 src_port_max: int = 65535):
+                 src_port_max: int = 65535,
+                 tls13_probability: float = 0.5):
         self.tun_ip = tun_ip
         self.src_port_min = src_port_min
         self.src_port_max = src_port_max
         # TLS CH 模板（从真实流量捕获）
         self._template: Optional[bytes] = None
+        # ★ 新增：TLS 1.3 概率
+        self._tls13_probability = tls13_probability
 
     def set_template(self, template: bytes):
         """设置从真实流量捕获的 TLS CH 模板"""
@@ -39,12 +45,15 @@ class TCPNoisePacketGenerator:
     def _build_tls_from_template(self, fake_sni: Optional[str]) -> bytes:
         """
         基于真实浏览器 TLS CH 模板生成噪声 TLS CH
-
-        概率混合策略（防止单一指纹被识别）:
-        - 50%: 精确复制模板（替换 Random+SessionID）→ 和真实浏览器完全相同
-        - 30%: 模板 + 随机修改扩展字节 → 与真实相似但有变异
-        - 20%: 完全随机 → 增加整体多样性
+        混合 TLS 1.2 和 TLS 1.3
         """
+        # ★ 决定 TLS 版本
+        use_tls13 = randfloat() < self._tls13_probability
+
+        if use_tls13:
+            return build_fake_tls13_client_hello(fake_sni=fake_sni)
+
+        # 以下是原有 TLS 1.2 逻辑
         r = randint(0, 100)
 
         # 20%: 完全随机
@@ -56,7 +65,7 @@ class TCPNoisePacketGenerator:
         # 替换 Random (固定偏移 11-42，32 字节)
         noise[11:43] = randbytes(32)
 
-        # 替换 Session ID 内容（偏移 43 = 长度字节）
+        # 替换 Session ID 内容
         sid_len = self._template[43]
         if sid_len > 0 and 44 + sid_len <= len(noise):
             noise[44:44 + sid_len] = randbytes(sid_len)
@@ -110,7 +119,11 @@ class TCPNoisePacketGenerator:
         if self._template:
             tls_payload = self._build_tls_from_template(fake_sni=fake_sni)
         else:
-            tls_payload = build_fake_tls_client_hello(fake_sni=fake_sni)
+            # ★ 50% 概率用 TLS 1.3
+            if randfloat() < self._tls13_probability:
+                tls_payload = build_fake_tls13_client_hello(fake_sni=fake_sni)
+            else:
+                tls_payload = build_fake_tls_client_hello(fake_sni=fake_sni)
 
         # 2. 随机 TCP 参数
         src_port = randint(self.src_port_min, self.src_port_max)
@@ -170,7 +183,6 @@ class TCPNoisePacketGenerator:
 
     def _random_tcp_options(self) -> Optional[bytes]:
         """生成随机 TCP 选项（约 30% 概率携带选项）"""
-        # 约 70% 概率不携带选项（randint(0,100) >= 70 时才生成）
         if randint(0, 100) >= 70:
             return None
 
@@ -197,3 +209,7 @@ class TCPNoisePacketGenerator:
             options += b"\x08\x0a" + ts_val + ts_ecr
 
         return options if options else None
+
+
+# ★ 添加 randfloat 导入别名（供内部使用）
+from .packet_builder import randfloat

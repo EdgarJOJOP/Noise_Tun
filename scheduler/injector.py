@@ -1,4 +1,4 @@
-"""统一噪声注入器 — 同域名同协议族选不同 IP 发噪声"""
+"""统一噪声注入器 — 同域名同协议族选不同 IP 发噪声（UDP/TCP 双协议）"""
 
 import asyncio
 import logging
@@ -15,6 +15,7 @@ from noise.udp_noise import UDPNoisePacketGenerator
 from dns.resolver import DoHResolver
 from dns.fake_sni import FakeSNIGenerator
 from .density import AdaptiveDensityController
+from .timing import RTTMonitor, TimingShaper
 
 logger = logging.getLogger("noisetunnel.injector")
 
@@ -36,15 +37,13 @@ class _RealTarget:
 
     def __init__(self, domain: str, used_ip: str, port: int):
         self.domain = domain
-        self.used_ip = used_ip  # 真实连接实际使用的 IP
+        self.used_ip = used_ip
         self.port = port
-        # 判断 IP 协议族
         self.family = 6 if ":" in used_ip else 4
         self.timestamp = time.time()
 
 
 def _ip_family(ip: str) -> int:
-    """返回 IP 协议族: 4=IPv4, 6=IPv6"""
     return 6 if ":" in ip else 4
 
 
@@ -53,11 +52,12 @@ class NoiseInjector:
     噪声注入器 — 从真实流量提取目标
 
     核心策略:
-    1. 用户访问 example.com:443 → SOCKS5 解析到 1.2.3.4 (IPv4)
+    1. 用户访问 example.com:443 -> SOCKS5 解析到 1.2.3.4 (IPv4)
     2. 记录: domain=example.com, used_ip=1.2.3.4, port=443, family=4
-    3. DoH 解析 example.com → IPv4=[1.2.3.4, 5.6.7.8], IPv6=[2606::1]
-    4. 噪声 → 选同域名同协议族其他 IP(5.6.7.8):443
-    5. TCP 噪声含假 SNI(不是 example.com)
+    3. DoH 解析 example.com -> IPv4=[1.2.3.4, 5.6.7.8], IPv6=[2606::1]
+    4. TCP 噪声 -> 选同域名同协议族其他 IP(5.6.7.8):443
+    5. UDP 噪声 -> 从 UDP raw socket 捕获的真实目标中选，同端口不同 IP
+    6. TCP 噪声含假 SNI(不是 example.com)
     """
 
     def __init__(self,
@@ -72,18 +72,14 @@ class NoiseInjector:
         self.tcp_gen = tcp_generator or TCPNoisePacketGenerator()
         self.udp_gen = udp_generator or UDPNoisePacketGenerator()
 
-        # 真实流量记录: [(domain, used_ip, port), ...]
         self._real_targets: list[_RealTarget] = []
-        # 域名解析缓存: domain -> _ResolvedDomain
         self._resolved: dict[str, _ResolvedDomain] = {}
-        # 域名解析时间戳（限频用）
         self._last_resolve_time: float = 0
 
-        self._target_ttl: float = 600.0       # 目标过期时间
-        self._resolve_interval: float = 300.0  # DoH 解析限频
-        self._max_real_targets: int = 50       # 最多跟踪 50 个目标
+        self._target_ttl: float = 600.0
+        self._resolve_interval: float = 300.0
+        self._max_real_targets: int = 50
 
-        # 保底目标
         self._fallback_targets: list[tuple[str, int]] = [
             ("1.1.1.1", 443), ("8.8.8.8", 443),
             ("1.1.1.1", 53), ("8.8.8.8", 53),
@@ -91,25 +87,42 @@ class NoiseInjector:
 
         self._running = False
         self._tasks: list[asyncio.Task] = []
-        # 持久 UDP socket（复用，无需每次新建）
         self._udp_sock = None
         self._loop = None
+
+        # 时序混淆
+        self._rtt_monitor = RTTMonitor()
+        self._timing_shaper = TimingShaper(self._rtt_monitor)
+
+        # 应用层噪声生成器（延迟导入）
+        self._quic_gen = None
+        self._http2_gen = None
+        self._ws_gen = None
+
+    def _lazy_init_app_noise(self):
+        if self._quic_gen is None:
+            from noise.quic_noise import QUICNoiseGenerator
+            from noise.http2_noise import HTTP2NoiseGenerator
+            from noise.websocket_noise import WebSocketNoiseGenerator
+            self._quic_gen = QUICNoiseGenerator()
+            self._http2_gen = HTTP2NoiseGenerator()
+            self._ws_gen = WebSocketNoiseGenerator()
 
     async def start(self):
         self._running = True
         self._loop = asyncio.get_event_loop()
-        # 创建持久 UDP socket
         try:
             import socket as sock_mod
             self._udp_sock = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_DGRAM)
         except Exception:
             self._udp_sock = None
+        self._lazy_init_app_noise()
         self._tasks = [
             asyncio.create_task(self._inject_loop("tcp")),
             asyncio.create_task(self._inject_loop("udp")),
             asyncio.create_task(self._resolve_loop()),
         ]
-        logger.info("噪声注入器已启动 (同域名同协议族不同IP噪声)")
+        logger.info("噪声注入器已启动 (UDP/TCP 双协议 + 时序混淆 + 应用层噪声)")
 
     async def stop(self):
         self._running = False
@@ -117,7 +130,6 @@ class NoiseInjector:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-        # 关闭 UDP socket
         if self._udp_sock:
             try:
                 self._udp_sock.close()
@@ -132,40 +144,48 @@ class NoiseInjector:
 
     def record_real_connection(self, domain: str, resolved_ip: str,
                                port: int, protocol: str):
-        """
-        记录一次真实连接
-
-        参数:
-            domain: 用户访问的域名
-            resolved_ip: 实际连接到的 IP（由 SOCKS5 代理提供）
-            port: 端口号
-            protocol: "tcp" 或 "udp"
-        """
+        """记录一次真实连接（TCP 和 UDP 均记录）"""
         self.density.record_connection()
 
-        if protocol == "tcp" and domain and port:
+        # 修复：不再限制 protocol == "tcp"
+        if domain and port:
             now = time.time()
-
-            # 去重
             self._real_targets = [
                 t for t in self._real_targets
-                if not (t.domain == domain and t.used_ip == resolved_ip and t.port == port)
+                if not (t.domain == domain and t.used_ip == resolved_ip
+                        and t.port == port and t.family == _ip_family(resolved_ip))
             ]
-
             self._real_targets.append(_RealTarget(domain, resolved_ip, port))
-
-            # 限长
             if len(self._real_targets) > self._max_real_targets:
                 self._real_targets = self._real_targets[-self._max_real_targets:]
+            logger.debug(f"真实流量[{protocol.upper()}]: {domain} "
+                         f"({resolved_ip}:{port}, IPv{_ip_family(resolved_ip)})")
 
-            logger.debug(f"真实流量: {domain} ({resolved_ip}:{port}, IPv{_ip_family(resolved_ip)})")
+    def record_real_udp_target(self, dst_ip: str, dst_port: int):
+        """从 UDPSampler 捕获的真实 UDP 包中提取目标"""
+        if not dst_ip or not dst_port:
+            return
+        pseudo_domain = f"{dst_ip}:{dst_port}"
+        now = time.time()
+        self._real_targets = [
+            t for t in self._real_targets
+            if not (t.domain == pseudo_domain and t.used_ip == dst_ip
+                    and t.port == dst_port)
+        ]
+        self._real_targets.append(_RealTarget(pseudo_domain, dst_ip, dst_port))
+        if len(self._real_targets) > self._max_real_targets:
+            self._real_targets = self._real_targets[-self._max_real_targets:]
+        logger.debug(f"UDP 真实目标: {dst_ip}:{dst_port}")
+
+    @property
+    def rtt_monitor(self):
+        return self._rtt_monitor
 
     # ------------------------------------------------------------------
     # 后台解析
     # ------------------------------------------------------------------
 
     async def _resolve_loop(self):
-        """后台解析任务"""
         while self._running:
             try:
                 await self._resolve_domains()
@@ -178,13 +198,11 @@ class NoiseInjector:
                 await asyncio.sleep(10.0)
 
     async def _resolve_domains(self):
-        """解析待处理的域名"""
         now = time.time()
         if now - self._last_resolve_time < self._resolve_interval:
             return
         self._last_resolve_time = now
 
-        # 取最近活跃的不同域名（最多 5 个）
         seen_domains: set[str] = set()
         domains_to_resolve: list[str] = []
         for t in sorted(self._real_targets, key=lambda x: x.timestamp, reverse=True):
@@ -208,7 +226,6 @@ class NoiseInjector:
             logger.info(f"已解析域名: {len(self._resolved)} 个 ({sample}...)")
 
     def _cleanup_expired(self):
-        """清理过期记录"""
         now = time.time()
         self._real_targets = [t for t in self._real_targets
                               if now - t.timestamp < self._target_ttl]
@@ -218,51 +235,62 @@ class NoiseInjector:
             del self._resolved[d]
 
     # ------------------------------------------------------------------
-    # 噪声目标选择（核心策略）
+    # 噪声目标选择（支持按协议过滤）
     # ------------------------------------------------------------------
 
-    def _pick_noise_target(self) -> tuple[Optional[str], Optional[int], Optional[str]]:
-        """
-        选择一个噪声目标
-
-        返回:
-            (ip, port, fake_sni)  或  (None, None, None) 无可用目标
-
-        策略:
-        1. 从最近真实流量中找一个
-        2. 取同域名的 DoH 解析结果
-        3. 从同协议族(IPv4/IPv6)中选一个不同于真实流量的 IP
-        4. 如果没其他 IP，尝试其他域名
-        """
+    def _pick_noise_target(self, protocol: str = "tcp"
+                           ) -> tuple[Optional[str], Optional[int], Optional[str]]:
         if not self._real_targets:
             ip, port = randchoice(self._fallback_targets)
             return ip, port, self.sni_gen.generate()
+        if protocol == "tcp":
+            return self._pick_tcp_noise_target()
+        else:
+            return self._pick_udp_noise_target()
 
-        # 从最新流量开始找
+    def _pick_tcp_noise_target(self):
         for real in reversed(self._real_targets):
             resolved = self._resolved.get(real.domain)
             if not resolved:
                 continue
-
-            # 选同协议族的其他 IP
             if real.family == 4 and resolved.ipv4:
                 others = [ip for ip in resolved.ipv4 if ip != real.used_ip]
                 if others:
-                    ip = randchoice(others)
-                    return ip, real.port, self.sni_gen.generate()
-
+                    return randchoice(others), real.port, self.sni_gen.generate()
             elif real.family == 6 and resolved.ipv6:
                 others = [ip for ip in resolved.ipv6 if ip != real.used_ip]
                 if others:
-                    ip = randchoice(others)
-                    return ip, real.port, self.sni_gen.generate()
+                    return randchoice(others), real.port, self.sni_gen.generate()
+        ip, port = randchoice(self._fallback_targets)
+        return ip, port, self.sni_gen.generate()
 
-        # 找不到同域名的其他 IP，用保底
+    def _pick_udp_noise_target(self):
+        udp_targets = [t for t in self._real_targets
+                       if ":" in t.domain]
+        if not udp_targets:
+            ip, port = randchoice(self._fallback_targets)
+            return ip, port, self.sni_gen.generate()
+
+        for real in reversed(udp_targets):
+            port = real.port
+            matched_domain = None
+            for domain, resolved in self._resolved.items():
+                all_ips = (resolved.ipv4 or []) + (resolved.ipv6 or [])
+                if real.used_ip in all_ips:
+                    matched_domain = domain
+                    others = [ip for ip in all_ips if ip != real.used_ip]
+                    if others:
+                        return randchoice(others), port, self.sni_gen.generate()
+                    break
+            if not matched_domain:
+                ip = f"{randint(1,254)}.{randint(0,254)}.{randint(0,254)}.{randint(1,254)}"
+                return ip, port, self.sni_gen.generate()
+
         ip, port = randchoice(self._fallback_targets)
         return ip, port, self.sni_gen.generate()
 
     # ------------------------------------------------------------------
-    # 噪声注入
+    # 噪声注入（集成时序混淆 + 应用层噪声）
     # ------------------------------------------------------------------
 
     async def _inject_loop(self, protocol: str):
@@ -273,13 +301,22 @@ class NoiseInjector:
                     await asyncio.sleep(1.0)
                     continue
 
-                base_interval = (1.0 - density) * 2.0 + 0.3
-                interval = base_interval * (0.5 + randfloat())
+                interval = self._timing_shaper.next_interval(density)
                 await asyncio.sleep(interval)
+
+                think_gap = self._timing_shaper.maybe_insert_think_gap()
+                if think_gap > 0:
+                    logger.debug(f"思考间隙 {think_gap:.1f}s")
+                    await asyncio.sleep(think_gap)
+                    continue
 
                 burst = randint(1, 3)
                 for _ in range(burst):
                     await self._inject_one(protocol)
+                    if burst > 1:
+                        await asyncio.sleep(
+                            self._rtt_monitor.get_sample_rtt() * 0.5
+                        )
 
             except asyncio.CancelledError:
                 break
@@ -288,22 +325,61 @@ class NoiseInjector:
                 await asyncio.sleep(1.0)
 
     async def _inject_one(self, protocol: str):
-        dst_ip, dst_port, fake_sni = self._pick_noise_target()
+        dst_ip, dst_port, fake_sni = self._pick_noise_target(protocol=protocol)
         if not dst_ip or not dst_port:
             return
-
         if protocol == "tcp":
+            await self._inject_tcp(dst_ip, dst_port, fake_sni)
+        else:
+            await self._inject_udp(dst_ip, dst_port)
+
+    async def _inject_tcp(self, dst_ip: str, dst_port: int,
+                          fake_sni: Optional[str]):
+        self._lazy_init_app_noise()
+        use_http2 = randfloat() < 0.2
+
+        if use_http2 and self._http2_gen:
+            h2_frame = self._http2_gen.generate_noise()
+            tls_record = (
+                bytes([0x17]) +  # Application Data
+                bytes([0x03, 0x03]) +
+                struct.pack("!H", len(h2_frame)) +
+                h2_frame
+            )
+            packet, tcp_hdr_len = self.tcp_gen.generate(
+                dst_ip, dst_port, fake_sni=None
+            )
+            payload_start = 20 + tcp_hdr_len
+            packet = packet[:payload_start] + tls_record
+            logger.debug(f"HTTP/2 噪声 -> {dst_ip}:{dst_port}")
+        else:
             packet, tcp_hdr_len = self.tcp_gen.generate(
                 dst_ip, dst_port, fake_sni=fake_sni
             )
-            logger.debug(f"TCP 噪声 → {dst_ip}:{dst_port} "
+            logger.debug(f"TCP 噪声 -> {dst_ip}:{dst_port} "
                          f"(SNI={fake_sni}, IPv{_ip_family(dst_ip)})")
-        else:
-            packet = self.udp_gen.generate(dst_ip, dst_port)
-            tcp_hdr_len = 0
-            logger.debug(f"UDP 噪声 → {dst_ip}:{dst_port} (IPv{_ip_family(dst_ip)})")
 
-        await self._send_packet(packet, dst_ip, dst_port, protocol, tcp_hdr_len)
+        await self._send_packet(packet, dst_ip, dst_port, "tcp", tcp_hdr_len)
+
+    async def _inject_udp(self, dst_ip: str, dst_port: int):
+        self._lazy_init_app_noise()
+        use_quic = randfloat() < 0.3
+
+        if use_quic and self._quic_gen:
+            quic_payload = self._quic_gen.generate(size_hint=randint(100, 500))
+            packet = self.udp_gen.generate(
+                dst_ip, dst_port, use_port_coherence=True
+            )
+            packet = packet[:28] + quic_payload
+            logger.debug(f"QUIC 噪声 -> {dst_ip}:{dst_port} (IPv{_ip_family(dst_ip)})")
+        else:
+            packet = self.udp_gen.generate(
+                dst_ip, dst_port, use_port_coherence=True
+            )
+            logger.debug(f"UDP 噪声 -> {dst_ip}:{dst_port} "
+                         f"(IPv{_ip_family(dst_ip)}, port_coherent)")
+
+        await self._send_packet(packet, dst_ip, dst_port, "udp", 0)
 
     async def _send_packet(self, packet: bytes, dst_ip: str,
                            dst_port: int, protocol: str,
@@ -332,7 +408,6 @@ class NoiseInjector:
                 await loop.run_in_executor(None, _send_tcp)
 
             else:
-                # UDP：使用持久 socket，无需新建/线程池
                 if self._udp_sock:
                     try:
                         udp_part = packet[20:]

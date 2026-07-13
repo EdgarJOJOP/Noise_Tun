@@ -9,7 +9,7 @@ from typing import Optional
 
 logger = logging.getLogger("noisetunnel.udp_sampler")
 
-# ── 内置常见 UDP 协议载荷模板（前 N 字节） ──
+# 内置常见 UDP 协议载荷模板（前 N 字节）
 _BUILTIN_TEMPLATES = [
     # DNS query header (12 bytes)
     b'\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00',
@@ -44,6 +44,8 @@ class UDPSampler:
     用于生成与真实流量统计分布相同的 UDP 噪声。
     如果 raw socket 不可用（无管理员权限），
     回退到内置常见 UDP 协议模板。
+
+    ★ 增强：同时提取真实 UDP 目标 (dst_ip, dst_port) 用于噪声寻址
     """
 
     def __init__(self, max_samples: int = 100, header_bytes: int = 24):
@@ -53,6 +55,10 @@ class UDPSampler:
         self._has_real_samples = False
         self._running = False
         self._task: Optional[asyncio.Task] = None
+
+        # ★ 新增：真实 UDP 目标回调 + 缓存
+        self._on_real_udp_target = None  # callable(dst_ip, dst_port)
+        self._recent_udp_targets: list[tuple[str, int]] = []
 
     # ── 手动添加样本 ──
 
@@ -75,6 +81,16 @@ class UDPSampler:
         if _BUILTIN_TEMPLATES:
             return random.choice(_BUILTIN_TEMPLATES)
         return None
+
+    # ★ 新增：UDP 目标回调
+
+    def set_on_real_udp_target(self, callback):
+        """注册回调：捕获到真实 UDP 目标时通知 injector"""
+        self._on_real_udp_target = callback
+
+    def get_recent_udp_targets(self, count: int = 5) -> list[tuple[str, int]]:
+        """返回最近捕获的 N 个 UDP 真实目标"""
+        return self._recent_udp_targets[-count:]
 
     # ── Raw Socket 捕获 ──
 
@@ -121,6 +137,16 @@ class UDPSampler:
                         payload_offset = ip_hl + 8
                         payload = packet[payload_offset:]
                         self.add_sample(payload)
+
+                        # ★ 新增：记录真实 UDP 目标
+                        dst_ip = ".".join(str(packet[16+i]) for i in range(4))
+                        dst_port = (packet[ip_hl+2] << 8) | packet[ip_hl+3]
+                        self._recent_udp_targets.append((dst_ip, dst_port))
+                        if len(self._recent_udp_targets) > 20:
+                            self._recent_udp_targets.pop(0)
+                        if self._on_real_udp_target:
+                            self._on_real_udp_target(dst_ip, dst_port)
+
                     except sock_mod.timeout:
                         continue
                     except Exception as e:

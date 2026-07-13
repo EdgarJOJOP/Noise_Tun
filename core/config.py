@@ -14,6 +14,8 @@ class Socks5Config:
     host: str = "localhost"
     port: int = 1086
     udp_enabled: bool = True
+    username: str = ""
+    password: str = ""
 
 
 @dataclass
@@ -22,6 +24,8 @@ class AdditionalBindConfig:
     enabled: bool = False
     host: str = "0.0.0.0"
     port: int = 1087
+    username: str = ""
+    password: str = ""
 
 
 @dataclass
@@ -44,8 +48,11 @@ class NoiseConfig:
 
     # 加密 DNS
     doh_url: str = "https://cloudflare-dns.com/dns-query"
+    fallback_doh_url: str = ""
     doh_timeout: float = 5.0
     dns_cache_ttl: int = 300
+    dns_cache_enabled: bool = True
+    enforce_doh_only: bool = True
 
 
 @dataclass
