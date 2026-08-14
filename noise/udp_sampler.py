@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-import random
+import os
 import struct
 import time
 from typing import Optional
@@ -77,9 +77,11 @@ class UDPSampler:
     def get_template(self) -> Optional[bytes]:
         """返回一个随机模板：优先真实样本，其次内置模板"""
         if self._samples:
-            return random.choice(self._samples)
+            idx = int.from_bytes(os.urandom(4), "big") % len(self._samples)
+            return self._samples[idx]
         if _BUILTIN_TEMPLATES:
-            return random.choice(_BUILTIN_TEMPLATES)
+            idx = int.from_bytes(os.urandom(4), "big") % len(_BUILTIN_TEMPLATES)
+            return _BUILTIN_TEMPLATES[idx]
         return None
 
     # ★ 新增：UDP 目标回调

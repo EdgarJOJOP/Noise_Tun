@@ -44,8 +44,37 @@ noise:
   # true=缓存 DNS 结果（省流量，默认），false=每次请求都查 DoH（获取最新 IP）
   dns_cache_enabled: false
   domain_pool_size: 200
-  # true=DoH 解析失败时阻断连接（绝不回退系统 DNS），false=允许回退
+  # true=DoH 解析失败时阻断连接（绝不回退系统 DNS，安全优先），false=允许回退（不推荐）
   enforce_doh_only: true
+
+  # Raw Socket 注入（需 Npcap 驱动）
+  raw_injection_enabled: true
+  raw_injection_required: false    # true=无 Npcap 时拒绝启动而非静默降级
+
+  # 域名池大小 (Risk 3: 用于批量解析获取海量噪声目标 IP)
+  domain_pool_size: 500
+
+  # curl_cffi 浏览器指纹
+  browser_fingerprints_enabled: true
+
+  # 真实流量分布采集
+  traffic_profiling_enabled: true
+
+  # 噪声专用 DoH（无域名拦截，用于解析 domain_sources / DomainPool 域名）
+  # ★ 主 DoH (doh_url) 配置了域名拦截防止毒域名，会误拦广告/追踪域名
+  #   噪声域名本身就是广告/追踪列表，需要用无拦截的 DoH 才能解析到真实 IP
+  # ★ 这些 IP 只会用于发噪声包，不会进入 domain_pool_size 等统计
+  noise_doh_url: "https://dns.alidns.com/dns-query"
+  noise_fallback_doh_url: "https://dns.quad9.net/dns-query"
+  noise_doh_timeout: 5.0
+  noise_dns_cache_ttl: 600
+  noise_dns_cache_enabled: true
+
+# 真实流量分布采集配置
+traffic_profiling:
+  enabled: true
+  max_samples: 10000
+  max_interval_samples: 5000
 
 # 自适应密度控制器配置
 density:
@@ -64,3 +93,14 @@ density:
   low_traffic_density: 0.50
   # 完全静默时：10% 心跳噪声，模拟后台应用活动
   silence_density: 0.10
+
+# 域名源配置 (用于实时获取新鲜域名, 替代随机生成)
+domain_sources:
+  enabled: true
+  refresh_interval: 86400    # 刷新间隔(秒), 默认24小时
+  urls:
+    - "https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/AdGuard/AdvertisingLite/AdvertisingLite.txt"
+    # 多源域名池：增加噪声目标的多样性，防止单一来源 IP 被预过滤
+    - "https://gh-proxy.com/https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/SpyFilter/sections/tracking_servers.txt"
+    - "https://gh-proxy.com/https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts"
+    - "https://gh-proxy.com/https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/BaseFilter/sections/adservers.txt"

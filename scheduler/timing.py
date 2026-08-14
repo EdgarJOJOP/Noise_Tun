@@ -4,7 +4,10 @@ import time
 import logging
 import math
 from collections import deque
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from noise.traffic_profile import TrafficProfile
 
 from noise.packet_builder import randint, randfloat
 
@@ -67,29 +70,38 @@ class TimingShaper:
 
     def __init__(self, rtt_monitor: RTTMonitor):
         self.rtt = rtt_monitor
+        self._profile: Optional['TrafficProfile'] = None
         self._in_burst = False
         self._burst_remaining = 0
         self._pause_until = 0.0
+
+    def set_traffic_profile(self, profile: 'TrafficProfile'):
+        """设置真实流量分布采集器 (用于发送间隔采样)"""
+        self._profile = profile
 
     def next_interval(self, density: float) -> float:
         """
         返回下次发送的等待秒数
 
-        参数:
-            density: 当前噪声密度 (0.0 ~ 1.0)
+        如果启用了 TrafficProfile 且有足够间隔数据,
+        从真实分布采样; 否则使用 RTT 基频计算。
         """
         now = time.time()
 
-        # 1) burst 模式：连续发送多个包
+        # 1) burst 模式
         if self._in_burst:
             if self._burst_remaining > 0:
                 self._burst_remaining -= 1
+                if self._profile and self._profile.has_interval_data():
+                    return self._profile.sample_interval() * (0.3 + randfloat() * 0.7)
                 base_rtt = self.rtt.get_sample_rtt()
                 return base_rtt * (0.3 + randfloat() * 0.7)
             else:
-                # burst 结束，进入 pause
                 self._in_burst = False
-                pause_dur = self.rtt.get_sample_rtt() * randint(5, 20)
+                if self._profile and self._profile.has_interval_data():
+                    pause_dur = self._profile.sample_interval() * randint(5, 20)
+                else:
+                    pause_dur = self.rtt.get_sample_rtt() * randint(5, 20)
                 self._pause_until = now + pause_dur
                 return pause_dur
 
@@ -103,6 +115,11 @@ class TimingShaper:
         self._in_burst = True
         burst_size = max(1, int(density * randint(3, 12)))
         self._burst_remaining = burst_size
+
+        if self._profile and self._profile.has_interval_data():
+            base = self._profile.sample_interval()
+            modulated = base * (1.0 + (1.0 - density) * randint(2, 8))
+            return max(0.010, modulated)
 
         base_rtt = self.rtt.get_sample_rtt()
         modulated = base_rtt * (1.0 + (1.0 - density) * randint(2, 8))

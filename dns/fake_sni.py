@@ -1,10 +1,33 @@
-"""假域名生成器 — 为 TLS SNI 生成随机但逼真的假域名"""
+"""假域名生成器 — 为 TLS SNI 生成随机但逼真的假域名 (CSPRNG)"""
 
-import random
+import os
 import logging
 from typing import List
 
 logger = logging.getLogger("noisetunnel.fake_sni")
+
+# CSPRNG 工具
+def _randint(min_v, max_v):
+    span = max_v - min_v + 1
+    if span <= 0:
+        return min_v
+    num_bytes = (span.bit_length() + 7) // 8
+    mask = (1 << (num_bytes * 8)) - 1
+    while True:
+        val = int.from_bytes(os.urandom(num_bytes), "big") & mask
+        if val < span:
+            return min_v + val
+
+def _randfloat():
+    return int.from_bytes(os.urandom(7), "big") / (1 << 56)
+
+def _choice(seq):
+    if not seq:
+        raise IndexError("empty sequence")
+    return seq[_randint(0, len(seq) - 1)]
+
+def _sample(population, k):
+    return [population[_randint(0, len(population) - 1)] for _ in range(k)]
 
 # 常见 TLD
 TLDS = [".com", ".org", ".net", ".io", ".app", ".dev",
@@ -32,15 +55,15 @@ class FakeSNIGenerator:
 
     def generate(self) -> str:
         """生成一个随机假域名"""
-        if random.random() < 0.5:
-            name = random.choice(WORDS)
+        if _randfloat() < 0.5:
+            name = _choice(WORDS)
         else:
-            parts = random.sample(WORDS, random.randint(2, 3))
+            parts = _sample(WORDS, _randint(2, 3))
             name = "-".join(parts)
 
-        tld = random.choice(TLDS)
-        if random.random() < 0.3:
-            name += str(random.randint(0, 999))
+        tld = _choice(TLDS)
+        if _randfloat() < 0.3:
+            name += str(_randint(0, 999))
 
         return name + tld
 

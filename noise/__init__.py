@@ -6,6 +6,8 @@ from .tcp_noise import TCPNoisePacketGenerator
 from .udp_noise import UDPNoisePacketGenerator
 from .udp_sampler import UDPSampler
 from .quic_noise import QUICNoiseGenerator
+from .raw_socket import RawInjector
+from .traffic_profile import TrafficProfile
 
 __all__ = [
     "build_fake_tls_client_hello",
@@ -14,4 +16,6 @@ __all__ = [
     "UDPNoisePacketGenerator",
     "UDPSampler",
     "QUICNoiseGenerator",
+    "RawInjector",
+    "TrafficProfile",
 ]

@@ -18,6 +18,8 @@ import logging
 import sys
 import signal
 import os
+import subprocess
+import time
 
 # ── 管理员权限自提升（Windows，静默） ──
 def _ensure_admin():
@@ -41,6 +43,29 @@ def _ensure_admin():
 
 _ensure_admin()
 
+# 定时重启
+_restart_timer: float = 0  # 启动时间, 在 main() 中设置
+
+def _trigger_restart():
+    """重启 NoiseTun 进程"""
+    logger.info("=" * 50)
+    logger.info("定时重启 NoiseTun...")
+    logger.info("=" * 50)
+    if os.name == 'posix':
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            logger.error("execv restart failed: %s", e)
+            subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
+            os._exit(0)
+    else:
+        try:
+            subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
+        except Exception as e:
+            logger.error("重启失败: %s", e)
+            return
+        os._exit(0)
+
 from core.config import Config
 from core.socks5_proxy import ProxyServer
 from dns.resolver import DoHResolver
@@ -50,6 +75,7 @@ from noise.tcp_noise import TCPNoisePacketGenerator
 from noise.udp_noise import UDPNoisePacketGenerator
 from noise.udp_sampler import UDPSampler
 from noise.quic_noise import QUICNoiseGenerator
+from noise.traffic_profile import TrafficProfile
 from scheduler.injector import NoiseInjector
 
 logger = logging.getLogger("noisetunnel")
@@ -77,7 +103,8 @@ async def main():
     logger.info("=" * 50)
     logger.info("NoiseTunnel 启动")
     logger.info(f"  SOCKS5:   {config.socks5.host}:{config.socks5.port}")
-    logger.info(f"  DoH:      {config.noise.doh_url}")
+    logger.info(f"  DoH:      {config.noise.doh_url} (主, 域名拦截)")
+    logger.info(f"  噪声 DoH: {config.noise.noise_doh_url} (无拦截, 域名源/DomainPool)")
     logger.info(f"  密度策略: 高流量={config.density.high_traffic_density:.0%}, "
                 f"低流量={config.density.low_traffic_density:.0%}, "
                 f"静默={config.density.silence_density:.0%}")
@@ -85,7 +112,7 @@ async def main():
     logger.info("=" * 50)
 
     # 初始化组件
-    # DNS
+    # DNS — 主 DoH（带域名拦截，用于用户真实流量）
     doh = DoHResolver(
         doh_url=config.noise.doh_url,
         fallback_doh_url=config.noise.fallback_doh_url,
@@ -93,7 +120,22 @@ async def main():
         cache_ttl=config.noise.dns_cache_ttl,
         cache_enabled=config.noise.dns_cache_enabled,
     )
+    # ★ 噪声专用 DoH（无域名拦截，用于解析 domain_sources / DomainPool）
+    #   主 DoH 会拦截广告/毒域名，噪声域名本身就是广告列表，需用无拦截的 DoH
+    noise_doh = DoHResolver(
+        doh_url=config.noise.noise_doh_url,
+        fallback_doh_url=config.noise.noise_fallback_doh_url,
+        timeout=config.noise.noise_doh_timeout,
+        cache_ttl=config.noise.noise_dns_cache_ttl,
+        cache_enabled=config.noise.noise_dns_cache_enabled,
+    )
     domain_pool = FakeSNIGenerator()
+
+    # 真实流量分布采集器 (用于包大小 & 发送间隔建模)
+    traffic_profile = TrafficProfile(
+        max_packet_samples=config.traffic_profiling.max_samples,
+        max_interval_samples=config.traffic_profiling.max_samples // 2,
+    ) if config.traffic_profiling.enabled else None
 
     # 密度控制器
     density_ctrl = AdaptiveDensityController(
@@ -118,6 +160,10 @@ async def main():
         max_payload=config.noise.max_payload_size,
     )
 
+    # 将 TrafficProfile 注入噪声生成器
+    if traffic_profile:
+        udp_gen.set_traffic_profile(traffic_profile)
+
     # 假域名生成器（用于噪声 TLS CH 的 SNI 字段）
     domain_pool = FakeSNIGenerator()
 
@@ -128,7 +174,16 @@ async def main():
         fake_sni_gen=domain_pool,
         tcp_generator=tcp_gen,
         udp_generator=udp_gen,
+        domain_pool_size=config.noise.domain_pool_size,
+        noise_doh_resolver=noise_doh,  # ★ 噪声专用 DoH（无域名拦截）
     )
+    if traffic_profile:
+        injector.set_traffic_profile(traffic_profile)
+
+    # 传入域名源 URL (从 config.yaml 读取)
+    if config.domain_sources.enabled and config.domain_sources.urls:
+        injector.set_domain_source_urls(config.domain_sources.urls)
+        injector.set_fetch_interval(config.noise.refresh_interval or 86400)
 
     # UDP 采样器（捕获系统真实 UDP 载荷头做模板）
     udp_sampler = UDPSampler()
@@ -162,6 +217,7 @@ async def main():
         password=config.socks5.password,
         doh_resolver=doh,
         enforce_doh_only=config.noise.enforce_doh_only,
+        traffic_profile=traffic_profile,
     )
 
     # 检查端口是否被旧进程占用
@@ -178,9 +234,21 @@ async def main():
         return
 
     # ---- 启动 ----
+    start_time = time.time()
     try:
         # 1. 启动代理
         await proxy.start()
+
+        # 1b. 初始化 curl_cffi 浏览器指纹 (若配置启用)
+        if config.noise.browser_fingerprints_enabled:
+            await tcp_gen.init_curl_cffi()
+            await tcp_gen.start_refresh_loop()
+
+        # 1c. 检查 Raw Socket 注入状态 (风险 1)
+        if config.noise.raw_injection_required and not injector._raw_injector.is_raw:
+            logger.error("✕ raw_injection_required=true 但 Npcap 不可用!")
+            logger.error("  请安装 Npcap: https://npcap.com/")
+            raise RuntimeError("Npcap required but not available for raw socket injection")
 
         # 2. 启动噪声注入
         await injector.start()
@@ -188,8 +256,36 @@ async def main():
         # 3. 启动 UDP 采样（需要管理员权限，失败则静默使用内置模板）
         await udp_sampler.start_capture()
 
-        # 4. 等待终止信号
+        # 4. 等待终止信号 + 重启定时器
         stop_event = asyncio.Event()
+
+        # 重启监视器: 运行时间超过 refresh_interval 则重启
+        async def _restart_watcher():
+            while not stop_event.is_set():
+                await asyncio.sleep(60)
+                elapsed = time.time() - start_time
+                if elapsed >= config.noise.refresh_interval:
+                    logger.info(f"运行 {elapsed:.0f}s, 达到重启间隔, 执行重启")
+                    stop_event.set()
+                    # 给 finally 块一点时间做清理 (injector.stop 等)
+                    await asyncio.sleep(0.5)
+                    _trigger_restart()
+        
+        restart_task = asyncio.create_task(_restart_watcher())
+
+        # Metric 报告器: 每 5 分钟输出统计
+        async def _metrics_reporter():
+            while not stop_event.is_set():
+                await asyncio.sleep(300)
+                try:
+                    real_count = injector.get_real_conn_count()
+                    noise_count = injector.get_noise_pkt_count()
+                    ratio = noise_count / max(real_count, 1)
+                    logger.info(f"📊 统计 | 真实连接: {real_count} | 噪声注入: {noise_count} | 比率: {ratio:.2f}")
+                except Exception as e:
+                    logger.debug(f"Metric 报告异常: {e}")
+
+        metrics_task = asyncio.create_task(_metrics_reporter())
 
         def _signal_handler():
             logger.info("收到终止信号，正在关闭...")
@@ -202,6 +298,7 @@ async def main():
 
         logger.info("NoiseTunnel 运行中 (Ctrl+C 停止)")
         logger.info(f"→ 请将系统代理设为 SOCKS5 {config.socks5.host}:{config.socks5.port}")
+        logger.info(f"→ 定时重启: {config.noise.refresh_interval}s")
         await stop_event.wait()
 
     except asyncio.CancelledError:
@@ -212,6 +309,10 @@ async def main():
         await udp_sampler.stop_capture()
         await proxy.stop()
         await doh.close()
+        await noise_doh.close()  # ★ 关闭噪声专用 DoH
+        # 取消重启监视器
+        if 'restart_task' in dir():
+            restart_task.cancel()
         logger.info("NoiseTunnel 已关闭")
 
 

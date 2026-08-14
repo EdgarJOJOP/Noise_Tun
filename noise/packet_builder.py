@@ -2,8 +2,18 @@
 
 import os
 import struct
+import ipaddress
 import logging
-from typing import Optional
+from typing import Optional, List
+
+# 有效椭圆曲线公钥生成（用于 TLS key_share 扩展）
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, SECP256R1
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    _HAS_CRYPTOGRAPHY = True
+except ImportError:
+    _HAS_CRYPTOGRAPHY = False
 
 logger = logging.getLogger("noisetunnel.packet_builder")
 
@@ -52,7 +62,10 @@ def build_ip_header(total_length: int, protocol: int,
     构建 IPv4 头（全随机字段 + 自动校验和）
     """
     version_ihl = 0x45  # 版本=4, IHL=5
-    dscp_ecn = randbytes(1)[0] & 0xFC  # 随机 DSCP/ECN
+    # 常见 DSCP 值 (6-bit DSCP << 2, ECN=00):
+    # BE(0x00), CS1(0x20), AF11(0x28), AF12(0x30), AF13(0x38),
+    # AF21(0x48), AF22(0x50), AF23(0x58), AF31(0x68), AF41(0x88), EF(0xB8)
+    dscp_ecn = bytes([randchoice([0x00, 0x20, 0x28, 0x30, 0x38, 0x48, 0x50, 0x58, 0x68, 0x88, 0xB8])])[0]
     identification = int.from_bytes(randbytes(2), "big")
     flags_offset = int.from_bytes(randbytes(2), "big")
     ttl = randint(64, 255)
@@ -76,6 +89,26 @@ def build_ip_header(total_length: int, protocol: int,
     header = header[:10] + struct.pack("!H", checksum) + header[12:]
 
     return header
+
+
+def build_ipv6_header(payload_length: int, protocol: int,
+                      src_ip: str, dst_ip: str) -> bytes:
+    """
+    构建 IPv6 头（40 字节固定, 随机流标签 + 跳限）
+    """
+    version = 6
+    # IPv6 流量类别使用与 IPv4 DSCP 相同的常见值
+    traffic_class = randchoice([0x00, 0x20, 0x28, 0x30, 0x38, 0x48, 0x50, 0x58, 0x68, 0x88, 0xB8])
+    flow_label = randint(0, 0xFFFFF)
+    ver_tc_flow = (version << 28) | (traffic_class << 20) | flow_label
+    next_header = protocol
+    hop_limit = randint(64, 255)
+    src_bytes = ipaddress.IPv6Address(src_ip).packed
+    dst_bytes = ipaddress.IPv6Address(dst_ip).packed
+    return (struct.pack("!I", ver_tc_flow) +
+            struct.pack("!H", payload_length) +
+            struct.pack("!BB", next_header, hop_limit) +
+            src_bytes + dst_bytes)
 
 
 def _ip_checksum(data: bytes) -> int:
@@ -136,11 +169,19 @@ def build_tcp_header(src_port: int, dst_port: int,
 
 
 def compute_tcp_checksum(ip_src: bytes, ip_dst: bytes,
-                         tcp_header: bytes, payload: bytes) -> int:
-    """计算 TCP 校验和（含伪首部）"""
+                         tcp_header: bytes, payload: bytes,
+                         is_ipv6: bool = False) -> int:
+    """计算 TCP 校验和（含伪首部, 支持 IPv4 和 IPv6）"""
     tcp_segment = tcp_header + payload
-    pseudo = ip_src + ip_dst
-    pseudo += struct.pack("!BBH", 0, 6, len(tcp_segment))
+    if is_ipv6:
+        # IPv6 伪首部: src(16B) + dst(16B) + length(4B) + next_header(4B)
+        pseudo = ip_src + ip_dst
+        pseudo += struct.pack("!I", len(tcp_segment))
+        pseudo += struct.pack("!BBBB", 0, 0, 0, 6)  # zeros + TCP proto=6
+    else:
+        # IPv4 伪首部: src(4B) + dst(4B) + zeros(1B) + proto(1B) + length(2B)
+        pseudo = ip_src + ip_dst
+        pseudo += struct.pack("!BBH", 0, 6, len(tcp_segment))
     if len(pseudo) % 2 == 1:
         pseudo += b"\x00"
 
@@ -172,97 +213,127 @@ def build_udp_header(src_port: int, dst_port: int,
 # TLS Client Hello 构建（全随机结构）
 # ------------------------------------------------------------------
 
-def build_fake_tls_client_hello(fake_sni: Optional[str] = None) -> bytes:
+def build_fake_tls_client_hello(
+        fake_sni: Optional[str] = None,
+        cipher_suites: Optional[bytes] = None,
+        extensions: Optional[List[tuple]] = None,
+) -> bytes:
     """
-    构造一个结构完整的假 TLS Client Hello 记录
-    所有字段均为 CSPRNG 随机
+    构造 TLS 1.2 Client Hello 记录
 
     参数:
-        fake_sni: 如果提供，在 TLS 扩展中嵌入一个 SNI (server_name) 扩展
-                  使噪声包在明文 SNI 场景下显得更真实
+        fake_sni: 可选, 嵌入 SNI 扩展的假域名
+        cipher_suites: 可选, 密码套件字节序列。None=随机生成
+        extensions: 可选, [(ext_type_int, ext_data_bytes), ...] 的扩展列表。
+                    None=随机生成
+
+    当提供 cipher_suites/extensions 时, 使用真实浏览器指纹参数;
+    否则回退到全随机模式。
     """
-    # --- TLS 记录层 ---
     content_type = bytes([0x16])  # Handshake
-    # 随机 TLS 版本
     tls_version = randbytes(2)
-    # 确保版本合法
     if tls_version[0] == 0x03 and tls_version[1] in (0x00, 0x01, 0x02, 0x03, 0x04):
         pass
     else:
         tls_version = bytes([0x03, [0x01, 0x03, 0x04][randint(0, 2)]])
 
-    # --- Handshake 层 ---
     handshake_type = bytes([0x01])  # Client Hello
-
-    # --- 拼装 ---
     random_bytes = randbytes(32)
     session_id_len = randint(0, 32)
     session_id = randbytes(session_id_len)
 
-    # 随机密码套件（偶数个）
-    cs_count = randint(2, 16) * 2
-    cipher_suites = randbytes(cs_count)
+    # 密码套件: 指定或随机
+    if cipher_suites is not None and len(cipher_suites) >= 2:
+        cs_bytes = cipher_suites
+        cs_count = len(cs_bytes)
+    else:
+        cs_count = randint(2, 16) * 2
+        cs_bytes = randbytes(cs_count)
 
     compression_len = 1
-    compression = bytes([randint(0, 255)])
+    compression = bytes([0x00])  # TLS 1.2 通常用 null compression
 
-    # 随机扩展 + 可选假 SNI
-    ext_count = randint(0, 8)
-    extensions = b""
+    # 构建扩展
+    ext_bytes = b""
 
-    # 如果提供了假 SNI，先插入 SNI 扩展（type=0x0000）
+    # SNI 扩展 (type=0x0000), 优先于传入的扩展列表
     if fake_sni:
         sni_name = fake_sni.encode("utf-8")
         sni_ext_body = (
-            # server_name_list length (2 bytes)
             struct.pack("!H", len(sni_name) + 3) +
-            # NameType: host_name (0x00)
             b"\x00" +
-            # Name length (2 bytes)
             struct.pack("!H", len(sni_name)) +
             sni_name
         )
-        extensions += b"\x00\x00" + struct.pack("!H", len(sni_ext_body)) + sni_ext_body
+        ext_bytes += b"\x00\x00" + struct.pack("!H", len(sni_ext_body)) + sni_ext_body
 
-    # 其他随机扩展
-    for _ in range(ext_count):
-        ext_type = randbytes(2)
-        ext_len = randint(0, 100)
-        ext_data = randbytes(ext_len)
-        extensions += ext_type + struct.pack("!H", ext_len) + ext_data
+    if extensions is not None:
+        # 使用传入的真实扩展列表
+        for ext_type, ext_data in extensions:
+            ext_bytes += struct.pack("!H", ext_type) + struct.pack("!H", len(ext_data)) + ext_data
+    else:
+        # 随机扩展 (不含 SNI)
+        ext_count = randint(0, 8)
+        for _ in range(ext_count):
+            ext_type = randbytes(2)
+            ext_len = randint(0, 100)
+            ext_data = randbytes(ext_len)
+            ext_bytes += ext_type + struct.pack("!H", ext_len) + ext_data
 
-    # 版本字段（ClientHello 内）
     ch_version = tls_version
 
-    # 组装 ClientHello body
     ch_body = ch_version + random_bytes + bytes([session_id_len]) + session_id
-    ch_body += struct.pack("!H", cs_count) + cipher_suites
+    ch_body += struct.pack("!H", cs_count) + cs_bytes
     ch_body += bytes([compression_len]) + compression
-    ch_body += struct.pack("!H", len(extensions)) + extensions
+    ch_body += struct.pack("!H", len(ext_bytes)) + ext_bytes
 
-    # 再包 Handshake 层
     hs_body = handshake_type + len(ch_body).to_bytes(3, "big") + ch_body
-
-    # 最后包记录层
     record_body = content_type + tls_version + struct.pack("!H", len(hs_body))
-    record = record_body + hs_body
-
-    return record
+    return record_body + hs_body
 
 
 # ══════════════════════════════════════════════════════════════════════
-# TLS 1.3 ClientHello （新增）
+# 有效椭圆曲线公钥生成（用于 TLS key_share 扩展）
 # ══════════════════════════════════════════════════════════════════════
 
-def build_fake_tls13_client_hello(fake_sni: Optional[str] = None) -> bytes:
+def _gen_x25519_pubkey() -> bytes:
+    """生成真正的 X25519 公钥（32 字节 RFC 7748 格式）"""
+    if _HAS_CRYPTOGRAPHY:
+        priv = X25519PrivateKey.generate()
+        return priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    # fallback: 随机字节（至少比全零好）
+    return randbytes(32)
+
+
+def _gen_p256_pubkey() -> bytes:
+    """生成真正的 P-256 公钥（65 字节未压缩 X9.62 格式）"""
+    if _HAS_CRYPTOGRAPHY:
+        priv = generate_private_key(SECP256R1())
+        return priv.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+    # fallback: 随机字节
+    return randbytes(65)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TLS 1.3 ClientHello
+# ══════════════════════════════════════════════════════════════════════
+
+def build_fake_tls13_client_hello(
+        fake_sni: Optional[str] = None,
+        cipher_suites: Optional[bytes] = None,
+        extensions: Optional[List[tuple]] = None,
+) -> bytes:
     """
     构造 TLS 1.3 Client Hello
 
-    TLS 1.3 CH 与 1.2 的关键区别：
-    - supported_versions 扩展中版本 = 0x0304
-    - 必须包含 key_share 扩展
-    - 使用 TLS_AES_128_GCM_SHA256 (0x1301) 等新套件
-    - supported_groups = X25519 (0x001d) / P-256 (0x0017)
+    参数:
+        fake_sni: 可选, 嵌入 SNI 扩展的假域名
+        cipher_suites: 可选, TLS 1.3 密码套件字节序列。None=使用默认
+        extensions: 可选, [(ext_type_int, ext_data_bytes), ...] 的扩展列表。
+                    None=使用内置真实浏览器扩展
+
+    当提供参数时, 使用来自 curl_cffi 等指纹库的真实浏览器参数;
+    否则使用内置的通用 TLS 1.3 配置。
     """
     content_type = bytes([0x16])  # Handshake
     tls_version = bytes([0x03, 0x03])  # 记录层版本仍用 1.2
@@ -273,21 +344,25 @@ def build_fake_tls13_client_hello(fake_sni: Optional[str] = None) -> bytes:
     session_id_len = 32
     session_id = randbytes(session_id_len)
 
-    # TLS 1.3 密码套件
-    tls13_ciphers = bytes([
-        0x13, 0x01,  # TLS_AES_128_GCM_SHA256
-        0x13, 0x02,  # TLS_AES_256_GCM_SHA384
-        0x13, 0x03,  # TLS_CHACHA20_POLY1305_SHA256
-    ])
-    cs_count = len(tls13_ciphers)
+    # 密码套件
+    if cipher_suites is not None and len(cipher_suites) >= 2:
+        tls13_ciphers = cipher_suites
+        cs_count = len(tls13_ciphers)
+    else:
+        tls13_ciphers = bytes([
+            0x13, 0x01,  # TLS_AES_128_GCM_SHA256
+            0x13, 0x02,  # TLS_AES_256_GCM_SHA384
+            0x13, 0x03,  # TLS_CHACHA20_POLY1305_SHA256
+        ])
+        cs_count = len(tls13_ciphers)
 
     compression_len = 1
     compression = bytes([0x00])  # TLS 1.3 只允许 null compression
 
     # ---- 构建扩展 ----
-    extensions = b""
+    ext_bytes = b""
 
-    # 1) SNI (type=0x0000)
+    # SNI 扩展 (type=0x0000), 优先于传入列表
     if fake_sni:
         sni_name = fake_sni.encode("utf-8")
         sni_ext_body = (
@@ -296,41 +371,46 @@ def build_fake_tls13_client_hello(fake_sni: Optional[str] = None) -> bytes:
             struct.pack("!H", len(sni_name)) +
             sni_name
         )
-        extensions += b"\x00\x00" + struct.pack("!H", len(sni_ext_body)) + sni_ext_body
+        ext_bytes += b"\x00\x00" + struct.pack("!H", len(sni_ext_body)) + sni_ext_body
 
-    # 2) supported_versions (type=0x002b)
-    sv_body = bytes([0x03, 0x04])  # TLS 1.3 = 0x0304
-    extensions += b"\x00\x2b" + struct.pack("!H", len(sv_body)) + sv_body
+    if extensions is not None:
+        # 使用传入的真实扩展列表 (e.g. from curl_cffi)
+        # 注意: 扩展列表应包含 supported_versions, key_share 等必备项
+        for ext_type, ext_data in extensions:
+            ext_bytes += struct.pack("!H", ext_type) + struct.pack("!H", len(ext_data)) + ext_data
+    else:
+        # 内置通用 TLS 1.3 扩展
+        # supported_versions (type=0x002b)
+        sv_body = bytes([0x03, 0x04])  # TLS 1.3 = 0x0304
+        ext_bytes += b"\x00\x2b" + struct.pack("!H", len(sv_body)) + sv_body
 
-    # 3) key_share (type=0x0033)
-    ks_group = randchoice([b"\x00\x1d", b"\x00\x17"])  # X25519 or P-256
-    ks_key = randbytes(32 if ks_group == b"\x00\x1d" else 65)
-    ks_entry = ks_group + struct.pack("!H", len(ks_key)) + ks_key
-    ks_body = struct.pack("!H", len(ks_entry)) + ks_entry
-    extensions += b"\x00\x33" + struct.pack("!H", len(ks_body)) + ks_body
+        # key_share (type=0x0033) — 使用真正的椭圆曲线公钥
+        ks_group = randchoice([b"\x00\x1d", b"\x00\x17"])
+        ks_key = _gen_x25519_pubkey() if ks_group == b"\x00\x1d" else _gen_p256_pubkey()
+        ks_entry = ks_group + struct.pack("!H", len(ks_key)) + ks_key
+        ks_body = struct.pack("!H", len(ks_entry)) + ks_entry
+        ext_bytes += b"\x00\x33" + struct.pack("!H", len(ks_body)) + ks_body
 
-    # 4) signature_algorithms (type=0x000d)
-    sig_algs = bytes([0x04, 0x03, 0x08, 0x04, 0x08, 0x07, 0x04, 0x01])
-    sig_body = struct.pack("!H", len(sig_algs)) + sig_algs
-    extensions += b"\x00\x0d" + struct.pack("!H", len(sig_body)) + sig_body
+        # signature_algorithms (type=0x000d)
+        sig_algs = bytes([0x04, 0x03, 0x08, 0x04, 0x08, 0x07, 0x04, 0x01])
+        sig_body = struct.pack("!H", len(sig_algs)) + sig_algs
+        ext_bytes += b"\x00\x0d" + struct.pack("!H", len(sig_body)) + sig_body
 
-    # 5) supported_groups (type=0x000a)
-    groups = bytes([0x00, 0x1d, 0x00, 0x17, 0x00, 0x1e])
-    groups_body = struct.pack("!H", len(groups)) + groups
-    extensions += b"\x00\x0a" + struct.pack("!H", len(groups_body)) + groups_body
+        # supported_groups (type=0x000a)
+        groups = bytes([0x00, 0x1d, 0x00, 0x17, 0x00, 0x1e])
+        groups_body = struct.pack("!H", len(groups)) + groups
+        ext_bytes += b"\x00\x0a" + struct.pack("!H", len(groups_body)) + groups_body
 
-    # 6) psk_key_exchange_modes (type=0x002d)
-    psk_modes = bytes([0x01, 0x01])  # psk_dhe_ke
-    extensions += b"\x00\x2d" + struct.pack("!H", len(psk_modes)) + psk_modes
+        # psk_key_exchange_modes (type=0x002d)
+        psk_modes = bytes([0x01, 0x01])
+        ext_bytes += b"\x00\x2d" + struct.pack("!H", len(psk_modes)) + psk_modes
 
     # ---- 组装 ----
     ch_body = tls_version + random_bytes + bytes([session_id_len]) + session_id
     ch_body += struct.pack("!H", cs_count) + tls13_ciphers
     ch_body += bytes([compression_len]) + compression
-    ch_body += struct.pack("!H", len(extensions)) + extensions
+    ch_body += struct.pack("!H", len(ext_bytes)) + ext_bytes
 
     hs_body = handshake_type + len(ch_body).to_bytes(3, "big") + ch_body
     record_body = content_type + tls_version + struct.pack("!H", len(hs_body))
-    record = record_body + hs_body
-
-    return record
+    return record_body + hs_body
